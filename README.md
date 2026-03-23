@@ -4,8 +4,9 @@ A rudimentary Homebridge plugin for TCL Home air conditioners that brings your A
 
 ## Supported Devices
 
+Changed to also support Heating, Fan speed control and vertical swing. Device now recognised as Heater Cooler instead of Thermostat. Specifically adjusted for and tested with TCL TAC-18CHSD/XA71I 
 Currently tested and working with:
-- TCL P09F4CSW1K Portable Air Conditioner
+- TCL TAC-18CHSD/XA71I split Air Conditioner
 - Maybe other TCL Home app connected A/Cs (may require configuration)
 
 ## Features

@@ -49,23 +49,42 @@ class TclHomeApi {
     this.config = config;
     this.log = log;
     this.iotData = null;
+    this.lastInit = 0;
   }
 
   debug(message) { if (this.config.debugMode) this.log.info(`[DEBUG] ${message}`); }
 
   async initialize() {
-    await this.authenticate();
-    await this.getCloudUrls();
-    await this.refreshTokens();
-    await this.getAwsCredentials();
-    const region = this.cloudUrlsData.data.cloud_region;
-    AWS.config.update({ 
-        accessKeyId: this.awsCredentials.Credentials.AccessKeyId, 
-        secretAccessKey: this.awsCredentials.Credentials.SecretKey, 
-        sessionToken: this.awsCredentials.Credentials.SessionToken, 
-        region: region 
-    });
-    this.iotData = new AWS.IotData({ endpoint: `https://data-ats.iot.${region}.amazonaws.com` });
+    this.debug('🔑 Tokens verversen...');
+    try {
+      await this.authenticate();
+      await this.getCloudUrls();
+      await this.refreshTokens();
+      await this.getAwsCredentials();
+      
+      const region = this.cloudUrlsData.data.cloud_region;
+      AWS.config.update({ 
+          accessKeyId: this.awsCredentials.Credentials.AccessKeyId, 
+          secretAccessKey: this.awsCredentials.Credentials.SecretKey, 
+          sessionToken: this.awsCredentials.Credentials.SessionToken, 
+          region: region 
+      });
+      this.iotData = new AWS.IotData({ endpoint: `https://data-ats.iot.${region}.amazonaws.com` });
+      this.lastInit = Date.now();
+      this.debug('✅ Nieuwe sessie gestart');
+    } catch (e) {
+      this.log.error('❌ Login mislukt:', e.message);
+      throw e;
+    }
+  }
+
+  async ensureAuthenticated() {
+    // Proactieve refresh elke 60 minuten (SessionToken is vaak maar 1-2 uur geldig)
+    const eenUur = 60 * 60 * 1000;
+    if (!this.iotData || (Date.now() - this.lastInit > eenUur)) {
+      this.debug('⏰ Proactieve token refresh (60 min limiet)');
+      await this.initialize();
+    }
   }
 
   async authenticate() {
@@ -106,14 +125,31 @@ class TclHomeApi {
 
   async getDeviceState(deviceId) {
     try {
+      await this.ensureAuthenticated();
       const result = await this.iotData.getThingShadow({ thingName: deviceId }).promise();
       return JSON.parse(result.payload.toString()).state.reported;
-    } catch (error) { return null; }
+    } catch (error) {
+      if (error.statusCode === 403 || error.code === 'ForbiddenException') {
+        this.debug('🔄 Forbidden (403) bij status opvragen, sessie herstellen...');
+        await this.initialize();
+        return this.getDeviceState(deviceId);
+      }
+      return null;
+    }
   }
 
   async setDeviceState(deviceId, properties) {
-    const payload = { state: { desired: properties }, clientToken: `hb_${Date.now()}` };
-    await this.iotData.publish({ topic: `$aws/things/${deviceId}/shadow/update`, payload: JSON.stringify(payload), qos: 1 }).promise();
+    try {
+      await this.ensureAuthenticated();
+      const payload = { state: { desired: properties }, clientToken: `hb_${Date.now()}` };
+      await this.iotData.publish({ topic: `$aws/things/${deviceId}/shadow/update`, payload: JSON.stringify(payload), qos: 1 }).promise();
+    } catch (error) {
+      if (error.statusCode === 403 || error.code === 'ForbiddenException') {
+        this.debug('🔄 Forbidden (403) bij commando, sessie herstellen...');
+        await this.initialize();
+        await this.setDeviceState(deviceId, properties);
+      }
+    }
   }
 }
 
@@ -132,35 +168,25 @@ class TclAirConditioner {
 
   setupCharacteristics() {
     const Characteristic = this.platform.api.hap.Characteristic;
-    
-    // Aan/Uit & Modus
     this.service.getCharacteristic(Characteristic.Active).onSet(v => this.platform.tclApi.setDeviceState(this.device.deviceId, { powerSwitch: v ? 1 : 0 }));
     this.service.getCharacteristic(Characteristic.TargetHeaterCoolerState)
       .setProps({ validValues: [1, 2] })
       .onSet(v => this.platform.tclApi.setDeviceState(this.device.deviceId, { powerSwitch: 1, workMode: v === 1 ? 4 : 0 }));
-
-    // Temperatuur & Swing
     this.service.getCharacteristic(Characteristic.HeatingThresholdTemperature).setProps({ minValue: 16, maxValue: 30 }).onSet(v => this.setTemp(v));
     this.service.getCharacteristic(Characteristic.CoolingThresholdTemperature).setProps({ minValue: 18, maxValue: 30 }).onSet(v => this.setTemp(v));
     this.service.getCharacteristic(Characteristic.SwingMode).onSet(v => this.platform.tclApi.setDeviceState(this.device.deviceId, { verticalSwitch: v ? 1 : 0 }));
-    
-    // Ventilator Snelheid
-    this.service.getCharacteristic(Characteristic.RotationSpeed)
-      .setProps({ minValue: 0, maxValue: 100, minStep: 1 })
-      .onSet(v => this.setSpeed(v));
+    this.service.getCharacteristic(Characteristic.RotationSpeed).setProps({ minValue: 0, maxValue: 100, minStep: 1 }).onSet(v => this.setSpeed(v));
   }
 
   async setSpeed(v) {
     let speed = 0; 
-    if (v <= 10) speed = 0;       // Auto
-    else if (v <= 30) speed = 2;  // Laag
-    else if (v <= 50) speed = 3;  // Med-Laag
-    else if (v <= 70) speed = 4;  // Medium
-    else if (v <= 90) speed = 5;  // Med-Hoog
-    else speed = 6;               // Hoog / Boost
-
+    if (v <= 10) speed = 0;
+    else if (v <= 30) speed = 2;
+    else if (v <= 50) speed = 3;
+    else if (v <= 70) speed = 4;
+    else if (v <= 90) speed = 5;
+    else speed = 6;
     this.platform.tclApi.debug(`Fan Slider: ${v}% -> TCL Speed ${speed}`);
-    // Belangrijk: we updaten enkel de windSpeed. Geen powerSwitch meesturen voorkomt onbedoeld uitschakelen.
     await this.platform.tclApi.setDeviceState(this.device.deviceId, { windSpeed: speed });
   }
 
@@ -175,19 +201,8 @@ class TclAirConditioner {
     const targetTemp = state.targetTemperature || state.targetCelsiusDegree || 20;
     const stateKey = `${state.powerSwitch}-${state.workMode}-${targetTemp}-${state.windSpeed}-${state.verticalSwitch}`;
 
-    if (this.lastStateKey === stateKey) {
-        this.platform.tclApi.debug(`🔄 No state changes detected, skipping update`);
-    } else {
-        this.platform.tclApi.debug(`🔄 Polling sync: Power=${state.powerSwitch}, Mode=${state.workMode}, Wind=${state.windSpeed}, Temp=${targetTemp}°C`);
-        this.platform.tclApi.debug(`📊 Real device shadow state for ${this.device.deviceId}: {
-  powerSwitch: ${state.powerSwitch},
-  targetTemperature: ${targetTemp},
-  currentTemperature: ${state.currentTemperature || 20},
-  workMode: ${state.workMode},
-  windSpeed: ${state.windSpeed},
-  verticalSwitch: ${state.verticalSwitch},
-  isOnline: true
-}`);
+    if (this.lastStateKey !== stateKey) {
+        this.platform.tclApi.debug(`🔄 Sync: Power=${state.powerSwitch}, Wind=${state.windSpeed}, Temp=${targetTemp}°C`);
         this.lastStateKey = stateKey;
     }
 
@@ -198,8 +213,6 @@ class TclAirConditioner {
     if (isHeat) this.service.updateCharacteristic(Characteristic.HeatingThresholdTemperature, targetTemp);
     else this.service.updateCharacteristic(Characteristic.CoolingThresholdTemperature, targetTemp);
     this.service.updateCharacteristic(Characteristic.SwingMode, state.verticalSwitch ? 1 : 0);
-
-    // Map TCL terug naar HomeKit % (0 = 0% / Auto)
     const speedMap = { 0: 0, 2: 20, 3: 40, 4: 60, 5: 80, 6: 100 };
     this.service.updateCharacteristic(Characteristic.RotationSpeed, speedMap[state.windSpeed] || 0);
   }
